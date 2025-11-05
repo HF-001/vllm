@@ -321,8 +321,6 @@ def bind_kv_cache(
                 # case. Some test code depends on runner_kv_caches, but
                 # not in a way that's impacted by ignoring this.
                 pass
-            else:
-                raise NotImplementedError
         layer_name = layer_names[0]
         runner_kv_caches.append(kv_caches[layer_name])
 

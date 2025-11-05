@@ -1732,13 +1732,6 @@ class EngineArgs:
             else:
                 method = self.speculative_config.method
 
-            if method == "draft_model":
-                raise NotImplementedError(
-                    "Draft model speculative decoding is not supported yet. "
-                    "Please consider using other speculative decoding methods "
-                    "such as ngram, medusa, eagle, or mtp."
-                )
-
         V1_BACKENDS = [
             "FLASH_ATTN",
             "PALLAS",
