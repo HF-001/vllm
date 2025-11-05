@@ -120,15 +120,17 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
         raise ValueError(f"Load format `{load_format}` is not supported")
     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)
 
-
-def get_model(
-    *, vllm_config: VllmConfig, model_config: ModelConfig | None = None
-) -> nn.Module:
+def get_model(*,
+              vllm_config: VllmConfig,
+              model_config: Optional[ModelConfig] = None,
+              prefix: str = "",
+              ) -> nn.Module:
     loader = get_model_loader(vllm_config.load_config)
     if model_config is None:
         model_config = vllm_config.model_config
-    return loader.load_model(vllm_config=vllm_config, model_config=model_config)
-
+    return loader.load_model(vllm_config=vllm_config,
+                             model_config=model_config,
+                             prefix=prefix)
 
 __all__ = [
     "get_model",
