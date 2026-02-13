@@ -9,8 +9,8 @@ import inspect
 import json
 import pathlib
 import textwrap
-from collections.abc import Iterable, Mapping, Sequence, Set
-from dataclasses import MISSING, Field, field, fields, is_dataclass, replace
+from collections.abc import Callable, Iterable, Mapping, Sequence, Set
+from dataclasses import MISSING, Field, dataclass, field, fields, is_dataclass
 from itertools import pairwise
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
@@ -73,16 +73,34 @@ def get_field(cls: ConfigType, name: str) -> Field:
     )
 
 
-def getattr_iter(object: object, names: Iterable[str], default: Any) -> Any:
+def getattr_iter(
+    object: object,
+    names: Iterable[str],
+    default: Any | None = None,
+    default_factory: Callable[[], Any] | None = None,
+    warn: bool = False,
+) -> Any:
     """
     A helper function that retrieves an attribute from an object which may
     have multiple possible names. This is useful when fetching attributes from
     arbitrary `transformers.PretrainedConfig` instances.
+
+    In the case where the first name in `names` is the preferred name, and
+    any other names are deprecated aliases, setting `warn=True` will log a
+    warning when a deprecated name is used.
     """
-    for name in names:
+    for i, name in enumerate(names):
         if hasattr(object, name):
+            if warn and i > 0:
+                logger.warning_once(
+                    "%s contains a deprecated attribute name '%s'. "
+                    "Please use the preferred attribute name '%s' instead.",
+                    type(object).__name__,
+                    name,
+                    names[0],
+                )
             return getattr(object, name)
-    return default
+    return default_factory() if default_factory is not None else default
 
 
 def contains_object_print(text: str) -> bool:
@@ -166,6 +184,15 @@ class SupportsHash(Protocol):
 class SupportsMetricsInfo(Protocol):
     def metrics_info(self) -> dict[str, str]: ...
 
+def replace(dataclass_instance: ConfigT, /, **kwargs) -> ConfigT:
+    """Like [`dataclasses.replace`](https://docs.python.org/3/library/dataclasses.html#dataclasses.replace),
+    but compatible with Pydantic dataclasses which use `pydantic.fields.Field` instead
+    of `dataclasses.field`"""
+    cls = type(dataclass_instance)
+    dataclass_dict = dataclass_instance.__dict__
+    dataclass_dict = {k: v for k, v in dataclass_dict.items() if is_init_field(cls, k)}
+    dataclass_dict.update(kwargs)
+    return cls(**dataclass_dict)
 
 def update_config(config: ConfigT, overrides: dict[str, Any]) -> ConfigT:
     processed_overrides = {}
@@ -322,3 +349,35 @@ def handle_deprecated(
 
     for new_name in new_names:
         setattr(config, new_name, old_val)
+
+
+@dataclass
+class Range:
+    """
+    A range of numbers.
+    Inclusive of start, inclusive of end.
+    """
+
+    start: int
+    end: int
+
+    def is_single_size(self) -> bool:
+        return self.start == self.end
+
+    def __contains__(self, size: int) -> bool:
+        # Inclusive of start, inclusive of end
+        return self.start <= size <= self.end
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Range):
+            return False
+        return self.start == other.start and self.end == other.end
+
+    def __hash__(self) -> int:
+        return hash((self.start, self.end))
+
+    def __str__(self) -> str:
+        return f"({self.start}, {self.end})"
+
+    def __repr__(self) -> str:
+        return self.__str__()
