@@ -3788,6 +3788,15 @@ class GPUModelRunner(
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
+        # For CPU-based proposers with async scheduling, set a temporary
+        # prev_sampled_token_ids to prevent the shape[-1]==1 assertion
+        # inside _bookkeeping_sync when sampled tensor has spec-decode
+        # columns (shape [N, K] with K > 1). The real value is set later
+        # in _finalize_cpu_proposer_async.
+        if propose_drafts_after_bookkeeping and self.use_async_scheduling:
+            self.input_batch.prev_sampled_token_ids = (
+                sampler_output.sampled_token_ids[:, :1])
+
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -3809,7 +3818,14 @@ class GPUModelRunner(
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
+            if self.use_async_scheduling:
+                valid_sampled_token_ids = self._sync_for_cpu_proposer(
+                    sampler_output.sampled_token_ids,
+                    invalid_req_indices,
+                )
             propose_draft_token_ids(valid_sampled_token_ids)
+            if self.use_async_scheduling:
+                self._finalize_cpu_proposer_async(valid_sampled_token_ids)
 
         # Clear KV connector metadata after draft model runs (if spec decode).
         # This was deferred from target model forward to allow draft model
@@ -3956,6 +3972,108 @@ class GPUModelRunner(
         assert self.draft_token_ids_cpu is not None
         self.draft_token_ids_event.synchronize()
         return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
+
+    def _sync_for_cpu_proposer(
+        self,
+        sampled_token_ids: torch.Tensor,
+        invalid_req_indices: list[int],
+    ) -> list[list[int]]:
+        """Sync sampled tokens from GPU to CPU for CPU-based proposers
+        (e.g., suffix decoding) when async scheduling is enabled.
+
+        In async mode, _bookkeeping_sync skips the GPU->CPU sync and writes
+        -1 placeholders into token_ids_cpu / output_token_ids. This method
+        performs the real sync and overwrites those placeholders so that
+        CPU-based proposers see correct token history.
+        """
+        max_gen_len = sampled_token_ids.shape[-1]
+        if max_gen_len == 1:
+            # No spec decode tokens from prior iteration.
+            valid_sampled_token_ids = self._to_list(sampled_token_ids)
+            for i in invalid_req_indices:
+                valid_sampled_token_ids[i].clear()
+        else:
+            # Includes spec decode tokens — parse accepted tokens.
+            valid_sampled_token_ids, _ = RejectionSampler.parse_output(
+                sampled_token_ids,
+                self.input_batch.vocab_size,
+                invalid_req_indices,
+            )
+
+        # Overwrite -1 placeholders in token_ids_cpu and output_token_ids.
+        req_ids = self.input_batch.req_ids
+        for req_idx, sampled_ids in enumerate(valid_sampled_token_ids):
+            if not sampled_ids:
+                continue
+            # _bookkeeping_sync wrote a single -1 at the current
+            # num_tokens_no_spec - 1 position. Overwrite with real token(s).
+            placeholder_pos = self.input_batch.num_tokens_no_spec[req_idx] - 1
+            num_real = len(sampled_ids)
+            end_idx = placeholder_pos + num_real
+            self.input_batch.token_ids_cpu[
+                req_idx, placeholder_pos:end_idx] = sampled_ids
+            self.input_batch.is_token_ids[
+                req_idx, placeholder_pos:end_idx] = True
+            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+
+            # Fix output_token_ids: replace the -1 placeholder with the
+            # base (first) token only. Accepted draft tokens will be
+            # appended by _update_states (as -1 placeholders) in the next
+            # iteration, consistent with the EAGLE/DraftModel async flow.
+            req_state = self.requests[req_ids[req_idx]]
+            req_state.output_token_ids[-1] = sampled_ids[0]
+
+        return valid_sampled_token_ids
+
+    def _finalize_cpu_proposer_async(
+        self,
+        valid_sampled_token_ids: list[list[int]],
+    ) -> None:
+        """Finalize async scheduling state after a CPU-based proposer runs.
+
+        - Converts list-based draft tokens to a padded GPU tensor (required
+          by _prepare_input_ids which uses GPU scatter).
+        - Sets prev_sampled_token_ids to the last accepted token per request
+          (shape [N, 1]) for _prepare_input_ids to scatter into input_ids.
+        - Sets valid_sampled_token_count_cpu with the number of accepted
+          tokens per request, consumed by _update_states to adjust
+          num_computed_tokens.
+        """
+        num_reqs = len(self.input_batch.req_ids)
+
+        # Convert list-based draft tokens to a padded GPU tensor.
+        if isinstance(self._draft_token_ids, list):
+            draft_list = self._draft_token_ids
+            padded = torch.zeros(
+                (num_reqs, self.num_spec_tokens),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            for i, row in enumerate(draft_list):
+                if row:
+                    n = min(len(row), self.num_spec_tokens)
+                    padded[i, :n] = torch.tensor(
+                        row[:n], dtype=torch.int32)
+            self._draft_token_ids = padded
+
+        # Build last accepted token and counts per request.
+        last_tok_list = []
+        counts_list = []
+        for toks in valid_sampled_token_ids:
+            last_tok_list.append(toks[-1] if toks else 0)
+            counts_list.append(len(toks))
+
+        # Set prev_sampled_token_ids (shape [N, 1] GPU tensor).
+        self.input_batch.prev_sampled_token_ids = torch.tensor(
+            last_tok_list, dtype=torch.int32, device=self.device,
+        ).unsqueeze(1)
+
+        # Set valid_sampled_token_count_cpu and record the event.
+        counts_cpu = self.valid_sampled_token_count_cpu
+        assert counts_cpu is not None
+        counts_cpu[:num_reqs] = torch.tensor(counts_list, dtype=torch.int64)
+        assert self.valid_sampled_token_count_event is not None
+        self.valid_sampled_token_count_event.record()
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
