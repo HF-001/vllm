@@ -750,23 +750,27 @@ class GPUModelRunner(
                 )
 
         # For CPU-based proposers (suffix) with async scheduling:
-        # pre-allocated pinned buffer for overlapped GPU->CPU copy of
-        # sampled_token_ids, and GPU buffers for the triton kernel outputs.
-        self.cpu_proposer_sampled_ids_pinned: torch.Tensor | None = None
-        self.cpu_proposer_sampled_ids_event: torch.Event | None = None
+        # GPU buffers for the triton kernel, backup tokens for discarded
+        # requests, and a pinned CPU buffer for list→GPU draft conversion.
+        self.cpu_proposer_backup_tokens: torch.Tensor | None = None
+        self.cpu_proposer_draft_pinned: torch.Tensor | None = None
         self.cpu_proposer_next_token_ids: torch.Tensor | None = None
         self.cpu_proposer_valid_counts: torch.Tensor | None = None
         if (self.num_spec_tokens and self.use_async_scheduling
                 and self.speculative_config is not None
                 and not (self.speculative_config.use_eagle()
                          or self.speculative_config.uses_draft_model())):
-            self.cpu_proposer_sampled_ids_pinned = torch.empty(
-                (self.max_num_reqs, self.num_spec_tokens + 1),
-                dtype=torch.int64,
+            self.cpu_proposer_backup_tokens = torch.empty(
+                self.max_num_reqs,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.cpu_proposer_draft_pinned = torch.empty(
+                (self.max_num_reqs, self.num_spec_tokens),
+                dtype=torch.int32,
                 device="cpu",
                 pin_memory=True,
             )
-            self.cpu_proposer_sampled_ids_event = torch.cuda.Event()
             self.cpu_proposer_next_token_ids = torch.empty(
                 self.max_num_reqs,
                 dtype=torch.int32,
@@ -3817,15 +3821,31 @@ class GPUModelRunner(
                     ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                     self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
             else:
-                propose_drafts_after_bookkeeping = input_fits_in_drafter
-
-        # For CPU-based proposers with async scheduling, run triton kernel
-        # and start async GPU->CPU copy *before* bookkeeping so the copy
-        # overlaps with CPU work. The triton kernel sets
-        # prev_sampled_token_ids and valid_sampled_token_count.
-        if propose_drafts_after_bookkeeping and self.use_async_scheduling:
-            self._prepare_cpu_proposer_async(
-                sampler_output.sampled_token_ids)
+                if self.use_async_scheduling:
+                    if input_fits_in_drafter:
+                        # Do ALL suffix/ngram drafting BEFORE bookkeeping
+                        # (ArcticInference B2 pattern). This avoids the
+                        # fragile placeholder fix-up in _sync_for_cpu_proposer.
+                        self._do_suffix_drafting_async(
+                            sampler_output.sampled_token_ids,
+                            spec_decode_common_attn_metadata,
+                            scheduler_output,
+                            spec_decode_metadata,
+                            hidden_states,
+                            sample_hidden_states,
+                            aux_hidden_states,
+                            slot_mappings,
+                        )
+                    elif self.valid_sampled_token_count_event is not None:
+                        # Input doesn't fit in drafter — still need to set
+                        # prev_sampled_token_ids and valid_sampled_token_count
+                        # for the next iteration.
+                        self._suffix_handle_not_fits(
+                            sampler_output.sampled_token_ids,
+                            scheduler_output,
+                        )
+                else:
+                    propose_drafts_after_bookkeeping = input_fits_in_drafter
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
@@ -3846,18 +3866,9 @@ class GPUModelRunner(
             )
 
         if propose_drafts_after_bookkeeping:
-            # ngram and other speculative decoding methods use the sampled
+            # Non-async CPU-based proposers (suffix/ngram) use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
-            if self.use_async_scheduling:
-                # Wait for overlapped async copy, parse tokens on CPU.
-                valid_sampled_token_ids = self._sync_for_cpu_proposer(
-                    invalid_req_indices,
-                )
             propose_draft_token_ids(valid_sampled_token_ids)
-            if self.use_async_scheduling:
-                # Convert draft list->tensor only (prev_sampled/counts
-                # already set by triton kernel).
-                self._finalize_cpu_proposer_async()
 
         # Clear KV connector metadata after draft model runs (if spec decode).
         # This was deferred from target model forward to allow draft model
@@ -4005,38 +4016,102 @@ class GPUModelRunner(
         self.draft_token_ids_event.synchronize()
         return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
 
-    def _prepare_cpu_proposer_async(
+    def _do_suffix_drafting_async(
+        self,
+        sampled_token_ids: torch.Tensor,
+        spec_decode_common_attn_metadata: "CommonAttentionMetadata | None",
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: "SpecDecodeMetadata | None",
+        hidden_states: torch.Tensor,
+        sample_hidden_states: torch.Tensor,
+        aux_hidden_states: "list[torch.Tensor] | None",
+        slot_mappings: "dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None",
+    ) -> None:
+        """Run suffix/ngram drafting BEFORE bookkeeping for async scheduling.
+
+        Follows ArcticInference's B2 pattern: rejection sample on GPU,
+        parse tokens to CPU, run suffix proposer, build draft tensor.
+        This avoids the fragile placeholder fix-up that was needed when
+        drafting happened after bookkeeping.
+        """
+        assert spec_decode_common_attn_metadata is not None
+        num_reqs = self.input_batch.num_reqs
+
+        # Step 1: Run triton kernel for rejection sampling
+        # (sets prev_sampled_token_ids and valid_sampled_token_count)
+        self._suffix_rejection_sample(sampled_token_ids)
+
+        # Step 2: Parse sampled tokens to CPU lists
+        discard_indices = np.nonzero(
+            self.discard_request_mask.np[:num_reqs])[0]
+        n_cols = sampled_token_ids.shape[-1]
+        if n_cols == 1:
+            sampled_cpu = self._to_list(sampled_token_ids)
+            for idx in discard_indices:
+                sampled_cpu[int(idx)].clear()
+        else:
+            sampled_cpu, _ = RejectionSampler.parse_output(
+                sampled_token_ids,
+                self.input_batch.vocab_size,
+                discard_indices,
+            )
+
+        # Step 3: Run suffix/ngram proposer (CPU work)
+        self._draft_token_ids = self.propose_draft_token_ids(
+            scheduler_output,
+            sampled_cpu,
+            self.input_batch.sampling_metadata,
+            hidden_states,
+            sample_hidden_states,
+            aux_hidden_states,
+            spec_decode_metadata,
+            spec_decode_common_attn_metadata,
+            slot_mappings,
+        )
+
+        # Step 4: Convert draft list → GPU tensor via pinned buffer
+        self._convert_draft_list_to_gpu_tensor()
+        self._copy_draft_token_ids_to_cpu(scheduler_output)
+
+    def _suffix_rejection_sample(
         self,
         sampled_token_ids: torch.Tensor,
     ) -> None:
-        """Run GPU-side computation and start async GPU->CPU copy before
-        _bookkeeping_sync, so that the copy overlaps with CPU bookkeeping.
+        """Run rejection sampling on GPU for suffix async scheduling.
 
-        1. Run triton kernel to compute next_token_ids and valid_counts
-           on GPU (same kernel EAGLE uses).
-        2. Call _copy_valid_sampled_token_count to set
-           prev_sampled_token_ids and async-copy counts to CPU.
-        3. Start async copy of sampled_token_ids to pinned CPU buffer.
+        Same as EAGLE's prepare_next_token_ids_padded but without needing
+        a drafter object. Sets prev_sampled_token_ids and
+        valid_sampled_token_count.
         """
-        num_reqs = len(self.input_batch.req_ids)
-        batch_size, num_tokens = sampled_token_ids.shape
+        num_reqs = self.input_batch.num_reqs
+        num_tokens = sampled_token_ids.shape[1]
 
         assert self.cpu_proposer_next_token_ids is not None
         assert self.cpu_proposer_valid_counts is not None
-        assert self.cpu_proposer_sampled_ids_pinned is not None
-        assert self.cpu_proposer_sampled_ids_event is not None
+        assert self.cpu_proposer_backup_tokens is not None
+
+        # Compute correct backup tokens for discarded requests.
+        # Use request.get_token_id(seq_len) — the actual expected token
+        # at that position — instead of sampled_token_ids[:, 0] which
+        # may be a meaningless value for discarded requests.
+        backup = self.cpu_proposer_backup_tokens
+        seq_lens_np = self.seq_lens.np
+        backup_np = np.empty(num_reqs, dtype=np.int32)
+        for i in range(num_reqs):
+            req_id = self.input_batch.req_ids[i]
+            backup_np[i] = self.requests[req_id].get_token_id(
+                int(seq_lens_np[i]))
+        backup[:num_reqs].copy_(
+            torch.from_numpy(backup_np), non_blocking=True)
 
         next_token_ids = self.cpu_proposer_next_token_ids[:num_reqs]
         valid_counts = self.cpu_proposer_valid_counts[:num_reqs]
 
-        # Run triton kernel to compute next_token_ids + valid_counts on GPU.
         BLOCK_SIZE_TOKENS = triton.next_power_of_2(num_tokens)
         eagle_prepare_next_token_padded_kernel[(num_reqs,)](
             sampled_token_ids,
             self.discard_request_mask.gpu,
-            # For suffix decoding, use first column as backup tokens
-            # (the base model's sampled token for each request).
-            sampled_token_ids[:num_reqs, 0],
+            backup,
             next_token_ids,
             valid_counts,
             self.input_batch.vocab_size,
@@ -4047,100 +4122,42 @@ class GPUModelRunner(
         )
 
         # Set prev_sampled_token_ids and async-copy counts to CPU.
-        self._copy_valid_sampled_token_count(
-            next_token_ids, valid_counts.to(torch.int64))
+        # copy_ handles int32→int64 conversion automatically.
+        self._copy_valid_sampled_token_count(next_token_ids, valid_counts)
 
-        # Start async copy of sampled_token_ids to pinned CPU buffer.
-        # Fill unused columns with -1 to avoid stale data in parsing.
-        pinned = self.cpu_proposer_sampled_ids_pinned
-        max_cols = pinned.shape[1]
-        if num_tokens < max_cols:
-            pinned[:num_reqs, num_tokens:].fill_(-1)
-        pinned[:num_reqs, :num_tokens].copy_(
-            sampled_token_ids[:num_reqs], non_blocking=True)
-        self.cpu_proposer_sampled_ids_event.record()
-
-    def _sync_for_cpu_proposer(
+    def _suffix_handle_not_fits(
         self,
-        invalid_req_indices: list[int],
-    ) -> list[list[int]]:
-        """Wait for async GPU->CPU copy and parse sampled tokens.
+        sampled_token_ids: torch.Tensor,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Handle suffix async when input doesn't fit in drafter.
 
-        Called after _bookkeeping_sync completes. Reads from the pre-synced
-        pinned buffer instead of performing a blocking GPU->CPU transfer.
+        Mirrors EAGLE's not-fits path: run rejection sampling to set
+        prev_sampled_token_ids and valid_sampled_token_count,
+        then emit zero draft tokens.
         """
-        assert self.cpu_proposer_sampled_ids_event is not None
-        assert self.cpu_proposer_sampled_ids_pinned is not None
+        self._suffix_rejection_sample(sampled_token_ids)
+        self._draft_token_ids = torch.zeros(
+            1, device=self.device, dtype=torch.int32
+        ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+        self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
-        # Wait for the async copy to complete.
-        self.cpu_proposer_sampled_ids_event.synchronize()
-
+    def _convert_draft_list_to_gpu_tensor(self) -> None:
+        """Convert list-based draft tokens to padded GPU tensor via pinned
+        buffer. No-op if draft tokens are already a tensor."""
+        if not isinstance(self._draft_token_ids, list):
+            return
         num_reqs = len(self.input_batch.req_ids)
-        # Determine number of sampled tokens per request from the pinned data.
-        # We need the original shape info — use num_spec_tokens + 1 as max.
-        pinned = self.cpu_proposer_sampled_ids_pinned
-        pinned_np = pinned[:num_reqs].numpy()
-
-        # Determine actual number of columns from the last iteration.
-        # Find the effective width by checking shape. The pinned buffer is
-        # always max width, but we can detect single-token vs multi-token
-        # by checking if column 1 is all zeros/uninitialized. Instead,
-        # use valid_sampled_token_count_cpu which was set by the triton kernel.
-        vocab_size = self.input_batch.vocab_size
-        invalid_set = set(invalid_req_indices)
-
-        # Parse valid tokens from the pinned numpy buffer (same logic as
-        # RejectionSampler.parse_output but on pre-synced CPU data).
-        valid_mask = (pinned_np != -1) & (pinned_np < vocab_size)
-        valid_sampled_token_ids: list[list[int]] = []
-        for i in range(num_reqs):
-            if i in invalid_set:
-                valid_sampled_token_ids.append([])
-            else:
-                row = pinned_np[i]
-                mask = valid_mask[i]
-                tokens = row[mask].tolist()
-                valid_sampled_token_ids.append(tokens)
-
-        # Overwrite -1 placeholders in token_ids_cpu and output_token_ids.
-        req_ids = self.input_batch.req_ids
-        for req_idx, sampled_ids in enumerate(valid_sampled_token_ids):
-            if not sampled_ids:
-                continue
-            placeholder_pos = self.input_batch.num_tokens_no_spec[req_idx] - 1
-            num_real = len(sampled_ids)
-            end_idx = placeholder_pos + num_real
-            self.input_batch.token_ids_cpu[
-                req_idx, placeholder_pos:end_idx] = sampled_ids
-            self.input_batch.is_token_ids[
-                req_idx, placeholder_pos:end_idx] = True
-            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
-
-            req_state = self.requests[req_ids[req_idx]]
-            req_state.output_token_ids[-1] = sampled_ids[0]
-
-        return valid_sampled_token_ids
-
-    def _finalize_cpu_proposer_async(self) -> None:
-        """Finalize async scheduling state after a CPU-based proposer runs.
-
-        Converts list-based draft tokens to a padded GPU tensor (required
-        by _prepare_input_ids which uses GPU scatter). The prev_sampled_token_ids
-        and valid_sampled_token_count are already set by the triton kernel
-        in _prepare_cpu_proposer_async.
-        """
-        num_reqs = len(self.input_batch.req_ids)
-
-        # Convert list-based draft tokens to a padded GPU tensor using numpy
-        # for batch padding (avoids per-row torch.tensor creation).
-        if isinstance(self._draft_token_ids, list):
-            draft_list = self._draft_token_ids
-            padded = np.zeros((num_reqs, self.num_spec_tokens), dtype=np.int32)
-            for i, row in enumerate(draft_list):
-                if row:
-                    n = min(len(row), self.num_spec_tokens)
-                    padded[i, :n] = row[:n]
-            self._draft_token_ids = torch.from_numpy(padded).to(self.device)
+        k = self.num_spec_tokens
+        assert self.cpu_proposer_draft_pinned is not None
+        pin = self.cpu_proposer_draft_pinned[:num_reqs, :k]
+        pin_np = pin.numpy()
+        pin_np[:] = 0
+        for i, row in enumerate(self._draft_token_ids):
+            if row:
+                n = min(len(row), k)
+                pin_np[i, :n] = row[:n]
+        self._draft_token_ids = pin.to(device=self.device, non_blocking=True)
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
