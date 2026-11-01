@@ -15,6 +15,7 @@ from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_mod
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
     assign_draft_token_budget,
+    build_verification_boundaries,
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
@@ -322,6 +323,73 @@ def global_topk_budget(
     admitted = torch.zeros(survival.numel(), dtype=torch.bool, device=survival.device)
     admitted[survival.flatten().topk(draft_budget).indices] = True
     return admitted.view_as(survival).sum(dim=1, dtype=torch.int32)
+
+
+@pytest.mark.parametrize(
+    "num_reqs,max_num_reqs", [(1, 512), (3, 512), (300, 512), (512, 512), (513, 513)]
+)
+@pytest.mark.parametrize("num_bonus_tokens", [1, 2])
+@pytest.mark.parametrize("draft_count", [0, 9, None])
+def test_verification_boundaries_match_torch(
+    num_reqs, max_num_reqs, num_bonus_tokens, draft_count
+):
+    """Preserve exact offsets for zero/full/ragged verification and graph padding."""
+    device = torch.device("cuda")
+    rows = torch.arange(num_reqs, dtype=torch.int32, device=device)
+    capacities = (
+        rows % 10 if draft_count is None else torch.full_like(rows, draft_count)
+    )
+    # Include a chunked prefill alongside verification requests.
+    non_drafts = rows % 17 + 1
+    query_start_loc = torch.full(
+        (max_num_reqs + 1,), -1, dtype=torch.int32, device=device
+    )
+    cu_num_logits = torch.full_like(query_start_loc, -1)
+    expected_queries = query_start_loc.clone()
+    expected_logits = cu_num_logits.clone()
+    expected_queries[:1].zero_()
+    torch.cumsum(capacities + non_drafts, 0, out=expected_queries[1 : num_reqs + 1])
+    expected_queries[num_reqs + 1 :] = expected_queries[num_reqs]
+    expected_logits[:1].zero_()
+    torch.cumsum(
+        capacities + num_bonus_tokens, 0, out=expected_logits[1 : num_reqs + 1]
+    )
+
+    build_verification_boundaries(
+        capacities, non_drafts, num_bonus_tokens, query_start_loc, cu_num_logits
+    )
+
+    assert torch.equal(query_start_loc, expected_queries)
+    assert torch.equal(cu_num_logits, expected_logits)
+
+
+def test_verification_boundaries_graph_replay_reads_updated_capacities():
+    """A captured scan must use the current admitted counts, including zero drafts."""
+    capacities = torch.tensor([9, 9, 9], dtype=torch.int32, device="cuda")
+    non_drafts = torch.tensor([1, 1, 32], dtype=torch.int32, device="cuda")
+    query_start_loc = torch.empty(9, dtype=torch.int32, device="cuda")
+    cu_num_logits = torch.empty_like(query_start_loc)
+    build_verification_boundaries(
+        capacities, non_drafts, 1, query_start_loc, cu_num_logits
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        build_verification_boundaries(
+            capacities, non_drafts, 1, query_start_loc, cu_num_logits
+        )
+
+    for admitted in ([9, 0, 0], [0, 0, 0], [1, 8, 0]):
+        capacities.copy_(torch.tensor(admitted, dtype=torch.int32, device="cuda"))
+        graph.replay()
+        expected_queries = torch.cat(
+            [non_drafts.new_zeros(1), (capacities + non_drafts).cumsum(0)]
+        )
+        expected_logits = torch.cat(
+            [capacities.new_zeros(1), (capacities + 1).cumsum(0)]
+        )
+        assert torch.equal(query_start_loc[:4], expected_queries)
+        assert torch.all(query_start_loc[4:] == expected_queries[-1])
+        assert torch.equal(cu_num_logits[:4], expected_logits)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -34,6 +34,51 @@ if TYPE_CHECKING:
     from vllm.v1.worker.utils import AttentionGroup
 
 
+@triton.jit(do_not_specialize=["num_reqs"])
+def _build_verification_boundaries_kernel(
+    capacities_ptr,
+    num_non_draft_tokens_ptr,
+    query_start_loc_ptr,
+    cu_num_logits_ptr,
+    num_reqs,
+    NUM_BONUS_TOKENS: tl.constexpr,
+    MAX_NUM_REQS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    active = offsets < num_reqs
+    capacities = tl.load(capacities_ptr + offsets, mask=active, other=0)
+    non_drafts = tl.load(num_non_draft_tokens_ptr + offsets, mask=active, other=0)
+    query_ends = tl.cumsum(capacities + non_drafts)
+    logits_ends = tl.cumsum(capacities + tl.where(active, NUM_BONUS_TOKENS, 0))
+    # Inactive query rows repeat the final offset for CUDA-graph padding.
+    tl.store(query_start_loc_ptr + offsets + 1, query_ends, mask=offsets < MAX_NUM_REQS)
+    tl.store(cu_num_logits_ptr + offsets + 1, logits_ends, mask=active)
+    tl.store(query_start_loc_ptr, 0)
+    tl.store(cu_num_logits_ptr, 0)
+
+
+def build_verification_boundaries(
+    capacities: torch.Tensor,
+    num_non_draft_tokens: torch.Tensor,
+    num_bonus_tokens: int,
+    query_start_loc: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+) -> None:
+    """Build compacted query/logits offsets, padding query rows in place."""
+    max_num_reqs = query_start_loc.numel() - 1
+    _build_verification_boundaries_kernel[(1,)](
+        capacities,
+        num_non_draft_tokens,
+        query_start_loc,
+        cu_num_logits,
+        capacities.numel(),
+        NUM_BONUS_TOKENS=num_bonus_tokens,
+        MAX_NUM_REQS=max_num_reqs,
+        BLOCK_SIZE=triton.next_power_of_2(max_num_reqs),
+    )
+
+
 def resolve_adaptive_cudagraph_mode(
     mode: CUDAGraphMode, *, piecewise_capture_available: bool
 ) -> CUDAGraphMode:
@@ -296,6 +341,14 @@ class AdaptiveVerificationManager:
         assign_draft_token_budget(
             self._confidence_probs, idx_mapping, capacities, 1, self._draft_survival
         )
+        non_drafts = self._num_non_draft_tokens[:1].fill_(1)
+        build_verification_boundaries(
+            capacities,
+            non_drafts,
+            self.num_bonus_tokens,
+            self.query_start_loc,
+            self._cu_num_logits,
+        )
 
     def add_request(self, req_idx: int) -> None:
         self._stale_confidences[self._stale_idx].np[req_idx].fill(1.0)
@@ -526,8 +579,6 @@ class AdaptiveVerificationManager:
             dtype=np.int32,
             count=num_reqs,
         )
-        num_tokens = int(num_non_draft_tokens.sum()) + draft_budget
-
         # Rank draft slots by survival probability and admit the best prefix.
         # capacities enters holding each request's valid draft count (the kernel
         # uses it to bound eligible slots) and leaves holding the admitted count.
@@ -547,19 +598,13 @@ class AdaptiveVerificationManager:
 
         num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]
         async_tensor_h2d(num_non_draft_tokens, out=num_non_draft_tokens_gpu)
-        self._cu_num_logits[:1].zero_()
-        torch.cumsum(
-            capacities + self.num_bonus_tokens,
-            dim=0,
-            out=self._cu_num_logits[1 : num_reqs + 1],
+        build_verification_boundaries(
+            capacities,
+            num_non_draft_tokens_gpu,
+            self.num_bonus_tokens,
+            self.query_start_loc,
+            self._cu_num_logits,
         )
-        self.query_start_loc[:1].zero_()
-        torch.cumsum(
-            capacities + num_non_draft_tokens_gpu,
-            dim=0,
-            out=self.query_start_loc[1 : num_reqs + 1],
-        )
-        self.query_start_loc[num_reqs + 1 :].fill_(num_tokens)
 
         admitted_drafts = None
         if self._copy_admitted_drafts_to_host and (

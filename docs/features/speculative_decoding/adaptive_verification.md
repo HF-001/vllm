@@ -17,6 +17,29 @@ Adaptive verification is supported for model-based drafters (EAGLE, MTP, DFlash,
 - **Confidence head**: DSpark checkpoints that ship a trained confidence head use its predictions directly.
 - **Online acceptance estimator**: every other drafter predicts acceptance from its draft logits with a small logistic model, recalibrated during serving against the target's verification results.
 
+### Hybrid Gated DeltaNet targets
+
+The GDN attention backend supports adaptive verification with Model Runner V2,
+including device-decided query lengths and variable-length decode CUDA graphs.
+Zero-draft rows still use the speculative recurrent-state path to restore the
+state selected by the previous step's accepted-token count. M-RoPE positions are
+prepared from the compacted device query boundaries.
+
+This backend support also applies to Qwen hybrid GDN targets; a particular
+target/draft checkpoint pair still needs model-level correctness and performance
+validation. Use a DSpark checkpoint trained for the target and set
+`num_speculative_tokens` to the checkpoint's supported draft length. Enable
+`enable_adaptive_verification` as shown below. Model Runner V2 is selected by
+default when supported, and can be explicitly selected with
+`VLLM_USE_V2_MODEL_RUNNER=1`.
+
+When comparing static and adaptive verification, keep the target, drafter,
+quantization, tensor parallelism, prompt/output lengths, concurrency, and cache
+settings identical. Include plain decoding as a third baseline and measure
+output tokens per second after startup profiling and warmup. Adaptive verification
+reduces target verification work; the draft model still runs, so it does not
+guarantee a speedup over plain decoding at high concurrency.
+
 ## Usage
 
 It is off by default. Enable it in the speculative config with `enable_adaptive_verification`. For example, with DSpark:
